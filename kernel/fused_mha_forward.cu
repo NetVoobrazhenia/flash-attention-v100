@@ -12,13 +12,13 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "debug.h"
+#include "template.h"
 #include "kernel.h"
 #include "forward.h"
 #include "gemm_smem.h"
 #include "mat_mul.h"
 #include "softmax.h"
 #include "dropout.h"
-#include "template.h"
 
 // ======================================================================================
 // FORWARD KERNEL
@@ -40,52 +40,50 @@ flash_attention_forward_kernel(
     const float    softmax_scale,
     const float    softcap,
     const float*   alibi_slopes,
-    int window_left,
-    int window_right,
+    const int      alibi_batch,
+    int            window_left,
+    int            window_right,
     const float    p_dropout,
     const uint64_t dropout_seed,
     const uint64_t dropout_offset
 ) {
     using Config = KernelConfig<D>;
-    constexpr int BLOCK_M   = Config::DO::BLOCK_M;
-    constexpr int BLOCK_N   = Config::DO::BLOCK_N;
-    constexpr int D_STRIDE  = Config::DO::D_STRIDE;
-    constexpr int N_STRIDE  = Config::DO::N_STRIDE;
 
-    const int   batch_head_id = blockIdx.z;
-    if (batch_head_id >= B * H_Q) return;
-    const float alibi_slope = (alibi_slopes) ? alibi_slopes[batch_head_id % H_Q] : 0.0f;
-    const int   block_idx = blockIdx.x;
-    const int   start_q = block_idx * BLOCK_M;
-    if (start_q >= M) return;
-    const int   valid_q_rows = min(BLOCK_M, M - start_q);
-    const int   seqlen_offset = N - M;
+    constexpr int BLOCK_M  = Config::DO::BLOCK_M;
+    constexpr int BLOCK_N  = Config::DO::BLOCK_N;
+    constexpr int D_STRIDE = Config::DO::D_STRIDE;
+    constexpr int N_STRIDE = Config::DO::N_STRIDE;
 
     // ==================================================================================
-    // Trim K/V iteration range for causal and sliding window attention (forward phase)
-    // Logic:    causal restricts K/V blocks beyond Q position (right bound)
-    //           window_left restricts blocks before Q - window_left (left bound)
-    //           window_right restricts blocks beyond Q + window_right (right bound)
-    //           block_min/block_max define valid [start, end) K/V tile index range
+    // Grid Mapping: X for Q-blocks, Z for batch-head composite (batch * H_Q + head).
     // ==================================================================================
-    int block_min = 0;
-    int block_max = (N + BLOCK_N - 1) / BLOCK_N;
+    const int bthd_idx     = blockIdx.z;
+    const int block_idx    = blockIdx.x;
 
-    if constexpr (IS_CAUSAL) {
-       const int max_key_pos = start_q + valid_q_rows - 1 + seqlen_offset;
-       block_max = (max_key_pos < 0) ? 0 : min(block_max, (max_key_pos / BLOCK_N) + 1);
-    }
+    if (bthd_idx >= B * H_Q) return;
 
-    if constexpr (IS_WINDOW) {
-        if (window_left >= 0) {
-            const int min_key_pos = start_q + seqlen_offset - window_left;
-            block_min = max(block_min, (min_key_pos > 0) ? (min_key_pos / BLOCK_N) : 0);
-        }
-        if (window_right >= 0) {
-            const int max_key_pos_win = start_q + valid_q_rows - 1 + seqlen_offset + window_right;
-            block_max = min(block_max, (max_key_pos_win >= 0) ? (max_key_pos_win / BLOCK_N) + 1 : 0);
-        }
-    }
+    // ======================================================================================
+    // BlockInfo: Metadata resolution (Dense Q-centric)
+    // ======================================================================================
+    BlockInfo<IS_CAUSAL, IS_WINDOW, false> block;
+    block.init_q(
+        block_idx,       // BLOCK_IDX:      Current Q-block index (grid.x)
+        bthd_idx,        // BATCH_HEAD_ID:  Global Q-head index (batch * H_Q + head_q)
+        H_Q,             // H_Q:            Number of query heads
+        H_K,             // H_K:            Number of KV heads
+        M,               // M:              Query sequence length
+        N,               // N:              KV sequence length
+        0,               // B:              Batch size (0 for dense, unused)
+        BLOCK_M,         // BLOCK_M:        Tile size along Q dimension
+        BLOCK_N,         // BLOCK_N:        Tile size along KV dimension
+        window_left,     // WINDOW_LEFT:    Left sliding window bound (-1 if disabled)
+        window_right,    // WINDOW_RIGHT:   Right sliding window bound (-1 if disabled)
+        nullptr,         // CU_SEQLENS_Q:   Cumulative Q lengths (nullptr for dense)
+        nullptr,         // CU_SEQLENS_K:   Cumulative KV lengths (nullptr for dense)
+        nullptr          // SEQUSED_K:      Actual KV lengths override (nullptr for dense)
+    );
+
+    if (block.start_q >= M) return;
 
     // ==================================================================================
     // Init:   thread/warp/lane IDs for WMMA coordination
@@ -93,18 +91,21 @@ flash_attention_forward_kernel(
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
+    // Alibi slope only for valid block + batch
+    const int   alibi_idx   = (alibi_batch > 0) ? (block.batch_idx * alibi_batch + block.head_idx) : block.head_idx;
+    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[alibi_idx] : 0.0f;
 
     // ==================================================================================
     // Layout:
-    //   Q/Out/LSE: [B, H_Q, M, D] offset follows batch_head_id (Q-head space)
-    //   K/V:       [B, H_K, N, D] mapped via batch_head_id % H_Q / (H_Q / H_K)
+    //   Q/Out/LSE: [B, H_Q, M, D] offset follows bthd_idx (Q-head space)
+    //   K/V:       [B, H_K, N, D] mapped via bthd_idx % H_Q / (H_Q / H_K)
     // ==================================================================================
-    const __half* __restrict__ q_ptr           = Q +           (size_t)batch_head_id * M * D + start_q * D;
-    const __half* __restrict__ k_ptr           = K +           (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
-    const __half* __restrict__ v_ptr           = V +           (size_t)((batch_head_id / H_Q) * H_K + (batch_head_id % H_Q) / (H_Q / H_K)) * N * D;
-          __half* __restrict__ out_ptr         = Out +         (size_t)batch_head_id * M * D + start_q * D;
-           float* __restrict__ softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
-          __half* __restrict__ dmask_ptr       = (dmask != nullptr) ? dmask + (size_t)batch_head_id * M * N : nullptr;
+    const __half* __restrict__ q_ptr           = Q           + block.q_offset  (D, H_Q, M);
+    const __half* __restrict__ k_ptr           = K           + block.kv_offset (D, H_K, N);
+    const __half* __restrict__ v_ptr           = V           + block.kv_offset (D, H_K, N);
+          __half* __restrict__ out_ptr         = Out         + block.q_offset  (D, H_Q, M);
+           float* __restrict__ softmax_lse_ptr = softmax_lse + block.lse_offset(H_Q, M);
+          __half* __restrict__ dmask_ptr       = (dmask != nullptr) ? dmask + block.dmask_offset(H_Q, M, N) : nullptr;
 
     // ==================================================================================
     // Init:   shared memory with zero-fill union regions to avoid stale data
@@ -128,6 +129,7 @@ flash_attention_forward_kernel(
 
     if (tid < BLOCK_M) {
         sRowMax[tid] = NEG_INF;
+        sRowSum[tid] = 0.0f;
     }
 
     // ==================================================================================
@@ -136,17 +138,16 @@ flash_attention_forward_kernel(
     // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
     // ==================================================================================
     WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-    q_ptr,   sQ,
-    nullptr, nullptr,
-    D, valid_q_rows, tid);
-
+      q_ptr,   sQ,
+      nullptr, nullptr,
+      D, block.valid_q_rows, tid);
     __syncthreads();
 
     // ==================================================================================
     // MAIN LOOP (iterates over K/V blocks for current Q block)
     // ==================================================================================
-    for (int block = block_min; block < block_max; ++block) {
-        const int start_kv = block * BLOCK_N;
+    for (int block_q = block.block_min; block_q < block.block_max; ++block_q) {
+        const int start_kv      = block_q * BLOCK_N;
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
         // ==================================================================================
@@ -155,10 +156,9 @@ flash_attention_forward_kernel(
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-        k_ptr + start_kv * D, sK,
-        nullptr, nullptr,
-        D, valid_kv_rows, tid);
-
+          k_ptr + start_kv * D, sK,
+          nullptr, nullptr,
+          D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -167,13 +167,11 @@ flash_attention_forward_kernel(
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
         WMMA_GEMM_SCORES<Config, GemmType::sQ_KT, D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE>(
-        sQ, sK, sS,
-        valid_q_rows,  valid_kv_rows,
-        start_q,       start_kv,
-        seqlen_offset,
-        softmax_scale, softcap, alibi_slope, window_left, window_right,
-        warp_id,       lane_id);
-
+          sQ, sK, sS,
+          block.valid_q_rows,  valid_kv_rows,
+          block.start_q,       start_kv,
+          block.seqlen_offset,
+          softmax_scale, softcap, alibi_slope, window_left, window_right, warp_id, lane_id);
         __syncthreads();
 
         // ==================================================================================
@@ -182,24 +180,21 @@ flash_attention_forward_kernel(
         // Template: BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE
         // ==================================================================================
         WMMA_GEMM_SOFTMAX<Config, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
-        sS, sP, sO,
-        sRowMax, sRowSum,
-        valid_q_rows, valid_kv_rows,
-        tid, block);
-
+          sS, sP, sO,
+          sRowMax, sRowSum,
+          block.valid_q_rows, valid_kv_rows, tid, block_q);
         __syncthreads();
 
         // ==================================================================================
-        // Compute:  Dropout mask to P tile
-        // Layout:   P[BLOCK_M, BLOCK_N] masked by dmask[start_q:start_q+BLOCK_M, start_kv:start_kv+BLOCK_N]
+        // Compute:  Apply dropout to P tile and generate dropout mask
+        // Layout:   P[BLOCK_M, BLOCK_N] (in SMEM) -> P_masked (in SMEM) Optionally store mask to dmask[BLOCK_M, BLOCK_N] in GMEM
         // Template: BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT
         // ==================================================================================
         WMMA_GEMM_DROPOUT<Config, BLOCK_M, BLOCK_N, N_STRIDE, IS_DROPOUT>(
-        sP, dmask_ptr ? dmask_ptr + start_q * N + start_kv : nullptr,
-        valid_q_rows, valid_kv_rows,
-        start_q, start_kv, N,
-        p_dropout, dropout_seed, dropout_offset, tid);
-
+          sP, dmask_ptr ? dmask_ptr + block.start_q * N + start_kv : nullptr,
+          block.valid_q_rows, valid_kv_rows,
+          block.start_q, start_kv, N,
+          p_dropout, dropout_seed, dropout_offset, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -208,10 +203,9 @@ flash_attention_forward_kernel(
         // Template: DUAL_LOAD=false, SRC_STRIDE=D, DST_STRIDE=D_STRIDE
         // ==================================================================================
         WMMA_GEMM_LOAD_TILE<Config, false, D_STRIDE>(
-        v_ptr + start_kv * D, sV,
-        nullptr, nullptr,
-        D, valid_kv_rows, tid);
-
+          v_ptr + start_kv * D, sV,
+          nullptr, nullptr,
+          D, valid_kv_rows, tid);
         __syncthreads();
 
         // ==================================================================================
@@ -220,10 +214,8 @@ flash_attention_forward_kernel(
         // Template: BLOCK_X=BLOCK_M, BLOCK_Y=BLOCK_N
         // ==================================================================================
         WMMA_GEMM_GRADIENTS<Config, GemmType::dO_PV, D, BLOCK_M, BLOCK_N, N_STRIDE, D_STRIDE>(
-        sP, sV, sO,
-        valid_q_rows, valid_kv_rows,
-        warp_id,      lane_id);
-
+          sP, sV, sO,
+          block.valid_q_rows, valid_kv_rows, warp_id, lane_id);
         __syncthreads();
     }   // END MAIN LOOP
     // ==================================================================================
@@ -232,12 +224,11 @@ flash_attention_forward_kernel(
     // Template  D, D_STRIDE  : Head dimension and shared memory stride
     // ==================================================================================
     WMMA_GEMM_EPILOGUE<Config, GemmType::write_dO, D_STRIDE>(
-    sO,      out_ptr,
-    nullptr, nullptr,
-    sRowSum,
-    D, valid_q_rows, tid);
+      sO,      out_ptr,
+      nullptr, nullptr,
+      sRowSum, D, block.valid_q_rows, tid);
 
-    if (tid < valid_q_rows) {
+    if (tid < block.valid_q_rows) {
         const float sum = fmaxf(sRowSum[tid], 1e-24f);
         softmax_lse_ptr[tid] = sRowMax[tid] + logf(sum);
     }
@@ -251,21 +242,25 @@ void launcher_flash_attention_forward(
     const torch::Tensor& Q,
     const torch::Tensor& K,
     const torch::Tensor& V,
-    torch::Tensor& Out,
-    torch::Tensor& softmax_lse,
+          torch::Tensor& Out,
+          torch::Tensor& softmax_lse,
     const torch::Tensor& dmask,
-    float softmax_scale,
-    bool is_causal,
-    float softcap,
-    float p_dropout,
+    float        softmax_scale,
+    bool         is_causal,
+    float        softcap,
+    float        p_dropout,
     const float* alibi_slopes,
-    int window_left,
-    int window_right,
-    uint64_t dropout_seed,
-    uint64_t dropout_offset,
+    const int    alibi_batch,
+    int          window_left,
+    int          window_right,
+    uint64_t     dropout_seed,
+    uint64_t     dropout_offset,
     cudaStream_t stream
 ) {
     using Config = KernelConfig<D>;
+
+    const size_t smem = Config::TOTAL_SMEM;
+    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for Forward kernel: ", smem, " bytes (", smem / 1024, " KB)");
 
     const int B   = Q.size(0);
     const int H_Q = Q.size(1);
@@ -275,107 +270,121 @@ void launcher_flash_attention_forward(
 
     const dim3 grid((M + Config::DO::BLOCK_M - 1) / Config::DO::BLOCK_M, 1, B * H_Q);
     const dim3 block(Config::THREADS_PER_BLOCK);
-    const size_t smem = Config::TOTAL_SMEM;
 
-    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB for Forward kernel: ", smem, " bytes (", smem / 1024, " KB)");
+    bool is_alibi       = (alibi_slopes != nullptr);
+    bool is_softcap     = (softcap > 0.0f);
+    bool is_window      = (window_left >= 0 || window_right >= 0);
+    bool is_dropout     = (p_dropout > 0.0f);
+    bool is_paged       = false;
+    bool is_rope        = false;
+    bool is_interleaved = false;
 
-    bool is_alibi   = (alibi_slopes != nullptr);
-    bool is_softcap = (softcap > 0.0f);
-    bool is_window  = (window_left >= 0 || window_right >= 0);
-    bool is_dropout = (p_dropout > 0.0f);
+    const __half* q_ptr     = reinterpret_cast<const __half*>(Q.data_ptr());
+    const __half* k_ptr     = reinterpret_cast<const __half*>(K.data_ptr());
+    const __half* v_ptr     = reinterpret_cast<const __half*>(V.data_ptr());
+          __half* out_ptr   = reinterpret_cast<__half*>(Out.data_ptr());
+           float* lse_ptr   = softmax_lse.data_ptr<float>();
+          __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
 
-    __half* dmask_ptr = dmask.numel() > 0 ? reinterpret_cast<__half*>(dmask.data_ptr()) : nullptr;
+    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout, is_paged, is_rope, is_interleaved,
+    [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT, auto /*PAGED*/, auto /*ROPE*/, auto /*INTERLEAVED*/) {
+        constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
+        constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
+        constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
+        constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
+        constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
 
-    dispatch_attention_features(is_causal, is_alibi, is_softcap, is_window, is_dropout,
-        [&](auto CAUSAL, auto ALIBI, auto SOFTCAP, auto WINDOW, auto DROPOUT) {
-            constexpr bool IS_CAUSAL  = decltype(CAUSAL)::value;
-            constexpr bool IS_ALIBI   = decltype(ALIBI)::value;
-            constexpr bool IS_SOFTCAP = decltype(SOFTCAP)::value;
-            constexpr bool IS_WINDOW  = decltype(WINDOW)::value;
-            constexpr bool IS_DROPOUT = decltype(DROPOUT)::value;
+        auto kernel = flash_attention_forward_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
-            auto kernel = flash_attention_forward_kernel<D, IS_CAUSAL, IS_ALIBI, IS_SOFTCAP, IS_WINDOW, IS_DROPOUT>;
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-
-            kernel<<<grid, block, smem, stream>>>(
-                reinterpret_cast<const __half*>(Q.data_ptr()),
-                reinterpret_cast<const __half*>(K.data_ptr()),
-                reinterpret_cast<const __half*>(V.data_ptr()),
-                reinterpret_cast<__half*>(Out.data_ptr()),
-                softmax_lse.data_ptr<float>(), dmask_ptr,
-                B, H_Q, H_K, M, N,
-                softmax_scale, softcap, alibi_slopes, window_left, window_right,
-                p_dropout, dropout_seed, dropout_offset);
-        });
+        kernel<<<grid, block, smem, stream>>>(
+            q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, dmask_ptr,
+            B, H_Q, H_K, M, N,
+            softmax_scale, softcap, alibi_slopes, alibi_batch, window_left, window_right,
+            p_dropout, dropout_seed, dropout_offset
+        );
+    });
 }
 
 // ======================================================================================
 // WRAPPER
 // ======================================================================================
 std::vector<at::Tensor> flash_attention_forward(
-    at::Tensor& q,
+          at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
     std::optional<at::Tensor>& out,
     std::optional<at::Tensor>& alibi_slopes,
-    const float p_dropout,
-    const float softmax_scale,
-    bool is_causal,
-    int window_left,
-    int window_right,
-    const float softcap,
-    const bool return_softmax,
+    const float  p_dropout,
+    const float  softmax_scale,
+    bool         is_causal,
+    int          window_left,
+    int          window_right,
+    const float  softcap,
+    const bool   return_softmax,
     std::optional<at::Generator> gen
 ) {
     // Device guard for multi-GPU / pipeline-parallelism
     at::cuda::CUDAGuard device_guard{q.device()};
 
-    auto props  = at::cuda::getCurrentDeviceProperties();
+    auto props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(props->major == 7 && props->minor == 0, "Kernel supports only Volta GPUs.");
-    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
-    TORCH_CHECK(k.dtype() == torch::kFloat16, "k must be fp16");
-    TORCH_CHECK(v.dtype() == torch::kFloat16, "v must be fp16");
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors must be on CUDA");
-    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim must be contiguous");
 
-    const auto sizes = q.sizes();
-    const int B      = sizes[0];
-    const int H_Q    = sizes[1];
-    const int M      = sizes[2];
-    const int D      = sizes[3];
-    const int H_K    = k.size(1);
-    const int N      = k.size(2);
+    // dtype / device / contiguity
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k.dtype() == q_dtype && v.dtype() == q_dtype, "k/v must have the same dtype as q");
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Tensors q, k, v must be on CUDA");
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Last dim of q, k, v must be contiguous");
 
-    TORCH_CHECK(B > 0, "batch_size must be positive");
-    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    // dimensions
+    const int B   = q.size(0);
+    const int H_Q = q.size(1);
+    const int M   = q.size(2);
+    const int D   = q.size(3);
+    const int H_K = k.size(1);
+    const int N   = k.size(2);
+
+    TORCH_CHECK(B > 0, "batch size must be positive");
+    TORCH_CHECK(D <= 256, "head dimension must be <= 256");
+    TORCH_CHECK(D % 8 == 0, "head dimension must be multiple of 8");
     TORCH_CHECK(H_Q % H_K == 0, "H_Q must be divisible by H_K for GQA/MQA");
 
-    // Window edge cases
-    if (window_left  >= N) { window_left  = -1; }
-    if (window_right >= N) { window_right = -1; }
+    // causal / window optimizations
     if (M == 1 && !alibi_slopes.has_value()) { is_causal = false; }
 
-    // Alibi
-    const float* alibi = nullptr;
-    if (alibi_slopes.has_value()) {
-        const auto& slopes = alibi_slopes.value();
-        auto sizes = slopes.sizes();
-        TORCH_CHECK(slopes.dtype() == torch::kFloat32, "alibi_slopes must be fp32");
-        TORCH_CHECK(slopes.is_cuda(), "alibi_slopes must be on CUDA");
-        TORCH_CHECK(slopes.stride(-1) == 1, "alibi_slopes last dim must be contiguous");
-        TORCH_CHECK(slopes.sizes() == torch::IntArrayRef({H_Q}) || slopes.sizes() == torch::IntArrayRef({B, H_Q}), "alibi_slopes shape must be [H_Q] or [B, H_Q]");
-        alibi = slopes.data_ptr<float>();
+    // softcap restrictions
+    if (softcap > 0.f) {
+        TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout");
     }
 
-    // Dropout
+    // window edge cases
+    if (window_left  >= N) window_left  = -1;
+    if (window_right >= N) window_right = -1;
+
+    // alibi
+    const float* alibi_ptr = nullptr;
+    int alibi_batch = 0;
+    if (alibi_slopes.has_value()) {
+        const auto& slopes = alibi_slopes.value();
+        TORCH_CHECK(slopes.dtype() == torch::kFloat32 && slopes.is_cuda(), "alibi_slopes must be fp32 on CUDA");
+        TORCH_CHECK(slopes.stride(-1) == 1, "alibi_slopes last dim must be contiguous");
+        auto sizes = slopes.sizes();
+        bool valid = (sizes.size() == 1 && sizes[0] == H_Q) ||
+                     (sizes.size() == 2 && sizes[0] == B && sizes[1] == H_Q);
+        TORCH_CHECK(valid, "alibi_slopes must be [H_Q] or [B, H_Q]");
+        alibi_batch = (sizes.size() == 2) ? slopes.stride(0) : 0;
+        alibi_ptr = slopes.data_ptr<float>();
+    }
+
+    // dropout
     TORCH_CHECK(p_dropout >= 0.f && p_dropout < 1.f, "p_dropout must be in [0, 1)");
     TORCH_CHECK(!return_softmax || p_dropout > 0.f, "return_softmax requires p_dropout > 0");
-    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout"); }
 
     uint64_t dropout_seed   = 0;
     uint64_t dropout_offset = 0;
+    at::Tensor rng_state = torch::empty({2}, torch::dtype(torch::kInt64).device(q.device()));
 
-    at::Tensor rng_state;
     if (p_dropout > 0.0f) {
         auto gen_cuda = at::get_generator_or_default<at::CUDAGeneratorImpl>(gen, at::cuda::detail::getDefaultCUDAGenerator());
         std::lock_guard<std::mutex> lock(gen_cuda->mutex_);
@@ -383,40 +392,43 @@ std::vector<at::Tensor> flash_attention_forward(
         dropout_offset = gen_cuda->get_offset();
         uint64_t counter_offset = static_cast<uint64_t>(B) * static_cast<uint64_t>(H_Q) * 32ULL;
         gen_cuda->set_offset(dropout_offset + counter_offset);
-        rng_state = torch::tensor(
-            {static_cast<int64_t>(dropout_seed), static_cast<int64_t>(dropout_offset)},
-            torch::dtype(torch::kInt64).device(q.device())
-        );
-    } else {
-        rng_state = torch::empty({2}, torch::dtype(torch::kInt64).device(q.device()));
+        rng_state[0] = static_cast<int64_t>(dropout_seed);
+        rng_state[1] = static_cast<int64_t>(dropout_offset);
     }
 
-    // Output tensors
+    // output tensors
     at::Tensor out_fp16 = out.has_value() ? out.value() : torch::empty_like(q);
     auto softmax_lse = torch::empty({B, H_Q, M}, torch::dtype(torch::kFloat32).device(q.device()));
-    TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");
+
+    TORCH_CHECK(out_fp16.dtype() == q_dtype, "out must have the same dtype as q");
+    TORCH_CHECK(out_fp16.is_cuda(), "out must be on CUDA");
+    TORCH_CHECK(out_fp16.stride(-1) == 1, "out must have contiguous last dimension");
+    if (out.has_value()) {
+        TORCH_CHECK(out_fp16.sizes() == q.sizes(), "out shape must match q shape");
+    }
     TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32, "softmax_lse must be fp32");
 
+    // dropout mask
     at::Tensor dmask;
-    if (return_softmax && (p_dropout > 0.0f)) {
+    if (return_softmax && p_dropout > 0.0f) {
         dmask = torch::empty({B, H_Q, M, N}, q.options());
     } else {
         dmask = torch::empty({0}, q.options());
     }
 
-    // Edge-case return
+    // empty case
     if (N == 0) {
         out_fp16.zero_();
-        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         return {out_fp16, softmax_lse, dmask, rng_state};
     }
 
-    // Run kernel
+    // run kernel
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     #define LAUNCH_KERNEL(DIM) \
         launcher_flash_attention_forward<DIM>(q, k, v, out_fp16, softmax_lse, dmask, softmax_scale, is_causal, \
-                                        softcap, p_dropout, alibi, window_left, window_right, dropout_seed, dropout_offset, stream);
+                                        softcap, p_dropout, alibi_ptr, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
     switch (D) {
         case 16:  LAUNCH_KERNEL(16);  break;
         case 32:  LAUNCH_KERNEL(32);  break;

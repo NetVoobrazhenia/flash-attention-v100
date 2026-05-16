@@ -1,6 +1,17 @@
-from flash_attn_v100 import flash_attn_func, flash_attn_gpu
+from flash_attn_v100.flash_attn_interface import (
+    flash_attn_func,
+    flash_attn_gpu,
+    flash_attn_varlen_func,
+    flash_attn_varlen_gpu,
+    flash_attn_with_kvcache,
+    flash_attn_with_kvcache_gpu
+)
 
-flash_attn_gpu = flash_attn_gpu
-flash_attn_func = flash_attn_func
-
-__all__ = ["flash_attn_gpu", "flash_attn_func"]
+__all__ = [
+    "flash_attn_func",
+    "flash_attn_gpu",
+    "flash_attn_varlen_func",
+    "flash_attn_varlen_gpu",
+    "flash_attn_with_kvcache",
+    "flash_attn_with_kvcache_gpu",
+]
